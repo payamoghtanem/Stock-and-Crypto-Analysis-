@@ -132,8 +132,7 @@ if df.empty:
     st.stop()
 
 # =============================================================================
-# 5) SUPPORT/RESISTANCE + BREAKOUTS
-#    FIX: ensure pivot candidates are 1-D Series with proper index (timestamps)
+# 5) SUPPORT/RESISTANCE + BREAKOUTS  (robust 1-D masks)
 # =============================================================================
 sr_levels, breakouts = [], []
 if sr_window and len(df) > sr_window + 5:
@@ -141,9 +140,18 @@ if sr_window and len(df) > sr_window + 5:
     roll_high = df["High"].rolling(sr_window, min_periods=sr_window).max()
     roll_low  = df["Low"].rolling(sr_window,  min_periods=sr_window).min()
 
-    # 1-D Series with timestamps where condition holds (no 2-D objects)
-    piv_res = df.loc[df["High"] >= roll_high, "High"]  # resistance candidates (Series)
-    piv_sup = df.loc[df["Low"]  <= roll_low,  "Low"]   # support candidates (Series)
+    # --- Build 1-D boolean masks using numpy (prevents multidimensional keys)
+    high_vals = df["High"].to_numpy()
+    low_vals  = df["Low"].to_numpy()
+    rh_vals   = roll_high.to_numpy()
+    rl_vals   = roll_low.to_numpy()
+
+    mask_res = high_vals >= rh_vals            # potential resistance (swing highs)
+    mask_sup = low_vals  <= rl_vals            # potential support (swing lows)
+
+    # Turn masks back into timestamp-indexed 1-D Series
+    piv_res = pd.Series(high_vals[mask_res], index=df.index[mask_res], name="High")
+    piv_sup = pd.Series(low_vals[mask_sup],  index=df.index[mask_sup],  name="Low")
 
     # Merge tolerance
     if "ATR14" in df.columns and not df["ATR14"].dropna().empty:
@@ -164,7 +172,7 @@ if sr_window and len(df) > sr_window + 5:
             try:
                 lvl = float(val)
             except Exception:
-                continue  # skip any weird value
+                continue
             if not levels or abs(lvl - levels[-1]["price"]) > tol:
                 levels.append({"price": lvl, "time": ts, "kind": kind})
             else:
@@ -172,6 +180,7 @@ if sr_window and len(df) > sr_window + 5:
                 levels[-1]["time"]  = ts
         return levels
 
+    # Final S/R list (supports + resistances)
     sr_levels = merge_levels(piv_sup, "S") + merge_levels(piv_res, "R")
 
     # Breakouts + pullbacks (simple rules)
@@ -198,6 +207,7 @@ if sr_window and len(df) > sr_window + 5:
                     b["return"] = "Pullback to R→S"
                 if b["type"] == "Breakdown ↓" and (lvl - band <= last <= lvl):
                     b["return"] = "Pullback to S→R"
+
 
 # =============================================================================
 # 6) PLOTTING
