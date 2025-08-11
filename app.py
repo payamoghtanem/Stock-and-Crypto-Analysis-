@@ -1,3 +1,16 @@
+# =============================================================================
+# Streamlit + Plotly app
+# Shows BTC/ETH/stocks from Yahoo Finance with 4h/1h/1d candles
+# Indicators: SMA, Bollinger Bands, RSI, MACD, ATR
+# Extras: Support/Resistance levels + breakout/pullback detection,
+#         in-memory date filter (no re-download), CSV export.
+#
+# Notes
+# - All indicators are DYNAMIC (recomputed for your chosen symbol/period/interval).
+# - S/R is heuristic (rolling extremes + level merging) for exploration only.
+# - Not trading advice.
+# =============================================================================
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -6,15 +19,28 @@ from plotly.subplots import make_subplots
 import streamlit as st
 from datetime import date, timedelta
 
+
+# =============================================================================
+# 1) PAGE SETUP
+# =============================================================================
 st.set_page_config(page_title="Crypto/Stocks Trend — Indicators", layout="wide")
 st.title("Crypto/Stocks Trend — Interactive (Plotly + Streamlit)")
 
-# ---------------- Sidebar ----------------
+# ---- Sidebar: high-level controls (symbol, interval, period) -----------------
 st.sidebar.header("Settings")
-symbol = st.sidebar.text_input("Symbol", value="BTC-USD", help="Any Yahoo symbol, e.g. BTC-USD, ETH-USD, AAPL")
-interval = st.sidebar.selectbox("Interval", ["4h", "1h", "1d"], index=0)
-period = st.sidebar.selectbox("Period (download window)", ["30d", "90d", "365d", "730d"], index=3)
 
+# Any Yahoo Finance symbol works: BTC-USD, ETH-USD, AAPL, TSLA, ^GSPC, etc.
+symbol = st.sidebar.text_input("Symbol", value="BTC-USD",
+                               help="Any Yahoo symbol, e.g. BTC-USD, ETH-USD, AAPL")
+
+# Candle interval. 4h is the default for crypto trend view.
+interval = st.sidebar.selectbox("Interval", ["4h", "1h", "1d"], index=0)
+
+# How much history to download (Yahoo imposes limits per interval).
+period = st.sidebar.selectbox("Period (download window)",
+                              ["30d", "90d", "365d", "730d"], index=3)
+
+# ---- Sidebar: indicator toggles ---------------------------------------------
 st.sidebar.subheader("Indicators")
 show_ma20  = st.sidebar.checkbox("SMA 20", True)
 show_ma50  = st.sidebar.checkbox("SMA 50", True)
@@ -24,18 +50,27 @@ show_rsi   = st.sidebar.checkbox("RSI (14)", True)
 show_macd  = st.sidebar.checkbox("MACD (12,26,9)", True)
 show_atr   = st.sidebar.checkbox("ATR (14)", True)
 
+# ---- Sidebar: Support/Resistance + breakout settings ------------------------
 st.sidebar.subheader("Support / Resistance")
+# Rolling window used to find recent swing highs/lows (bigger = fewer, stronger levels).
 sr_window = st.sidebar.slider("Swing window (bars)", 10, 200, 50)
+# Nearby levels are merged if within 'tolerance = ATR × this slider'.
 sr_merge_atr_mult = st.sidebar.slider("Merge tolerance (×ATR)", 0.1, 2.0, 0.5, 0.1)
 detect_breakouts = st.sidebar.checkbox("Detect breakouts/returns", True)
 
+# Misc UI
 use_log = st.sidebar.checkbox("Log scale (price)", False)
 if st.sidebar.button("Refresh now"):
-    st.cache_data.clear()
+    st.cache_data.clear()   # wipe cache to force re-download on next run
 
-# ---------------- Data ----------------
+
+# =============================================================================
+# 2) DATA LOADING (CACHED)
+#    - We download once per (symbol, period, interval) and reuse.
+# =============================================================================
 @st.cache_data(ttl=60*15, show_spinner=False)
 def load_data(sym: str, per: str, inter: str) -> pd.DataFrame:
+    """Download OHLCV from Yahoo Finance and drop empty rows."""
     df = yf.download(sym, period=per, interval=inter, auto_adjust=False, progress=False)
     return df.dropna()
 
@@ -46,18 +81,23 @@ if df.empty:
     st.warning("No data returned. Try a shorter period or a different interval.")
     st.stop()
 
-df = df.copy()
+df = df.copy()  # keep original cached frame safe
 
-# ---------------- Indicators ----------------
+
+# =============================================================================
+# 3) INDICATORS
+#    - Everything below is computed dynamically from the filtered DataFrame.
+# =============================================================================
 def ema(s: pd.Series, n: int) -> pd.Series:
+    """Exponential moving average."""
     return s.ewm(span=n, adjust=False).mean()
 
-# SMAs
+# --- Simple Moving Averages
 if show_ma20:  df["SMA20"]  = df["Close"].rolling(20).mean()
 if show_ma50:  df["SMA50"]  = df["Close"].rolling(50).mean()
 if show_ma200: df["SMA200"] = df["Close"].rolling(200).mean()
 
-# Bollinger Bands (20,2)
+# --- Bollinger Bands (20, 2σ)
 if show_bb:
     mid = df["Close"].rolling(20).mean()
     std = df["Close"].rolling(20).std(ddof=0)
@@ -65,37 +105,42 @@ if show_bb:
     df["BB_up"]  = mid + 2*std
     df["BB_lo"]  = mid - 2*std
 
-# ✅ RSI(14) — pandas-native, always 1-D
+# --- RSI(14): pandas-native to avoid shape issues
 if show_rsi:
-    delta = df["Close"].diff()
-    up   = delta.clip(lower=0)            # gains
-    down = (-delta).clip(lower=0)         # losses
-    roll_up = up.ewm(alpha=1/14, adjust=False).mean()
-    roll_dn = down.ewm(alpha=1/14, adjust=False).mean()
-    rs = roll_up / roll_dn.replace(0, np.nan)
+    delta   = df["Close"].diff()
+    gains   = delta.clip(lower=0)
+    losses  = (-delta).clip(lower=0)
+    avg_up  = gains.ewm(alpha=1/14, adjust=False).mean()
+    avg_dn  = losses.ewm(alpha=1/14, adjust=False).mean()
+    rs      = avg_up / avg_dn.replace(0, np.nan)
     df["RSI14"] = 100 - (100 / (1 + rs))
 
-# MACD (12,26,9)
+# --- MACD(12,26,9)
 if show_macd:
     ema12 = ema(df["Close"], 12)
     ema26 = ema(df["Close"], 26)
-    df["MACD"] = ema12 - ema26
+    df["MACD"]    = ema12 - ema26
     df["MACDsig"] = ema(df["MACD"], 9)
-    df["MACDhist"] = df["MACD"] - df["MACDsig"]
+    df["MACDhist"]= df["MACD"] - df["MACDsig"]
 
-# ATR(14)
+# --- ATR(14) = smoothed True Range (used standalone + for S/R merge tolerance)
 if show_atr or detect_breakouts:
-    prev_close = df["Close"].shift(1)
+    pc = df["Close"].shift(1)
     tr = pd.concat([
         (df["High"] - df["Low"]).abs(),
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs()
+        (df["High"] - pc).abs(),
+        (df["Low"]  - pc).abs()
     ], axis=1).max(axis=1)
     df["ATR14"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-# ---------------- Date filter (no re-download) ----------------
+
+# =============================================================================
+# 4) DATE RANGE FILTER (NO RE-DOWNLOAD)
+#    - Users can zoom to a subrange; indicators + S/R recompute on the subset.
+# =============================================================================
 min_date = df.index.min().date()
 max_date = df.index.max().date()
+
 st.sidebar.subheader("Date range (filter)")
 start_date, end_date = st.sidebar.date_input(
     "Start / End",
@@ -104,108 +149,179 @@ start_date, end_date = st.sidebar.date_input(
 )
 if isinstance(start_date, date) and isinstance(end_date, date) and start_date <= end_date:
     df = df.loc[str(start_date):str(end_date)]
+
 if df.empty:
     st.warning("No data after filtering.")
     st.stop()
 
-# ---------------- S/R + breakouts ----------------
+
+# =============================================================================
+# 5) SUPPORT/RESISTANCE + BREAKOUT & PULLBACK
+#    - S/R via rolling extremes over sr_window.
+#    - Nearby levels merged if within tolerance = median(ATR14) × slider.
+#    - Breakout Up: close crosses ABOVE last R. Down: BELOW last S.
+#    - Pullback: price revisits broken level within 0.5×ATR.
+# =============================================================================
 sr_levels, breakouts = [], []
+
 if sr_window and len(df) > sr_window + 5:
+    # Candidate pivot points (simple Donchian-style extremes)
     roll_high = df["High"].rolling(sr_window).max()
     roll_low  = df["Low"].rolling(sr_window).min()
-    piv_res = df["High"][(df["High"] >= roll_high)]
-    piv_sup = df["Low"][(df["Low"]  <= roll_low)]
+    piv_res = df["High"][df["High"] >= roll_high]   # resistance candidates
+    piv_sup = df["Low"][df["Low"]  <= roll_low]     # support candidates
 
+    # Tolerance to merge nearby levels (prefer ATR if available)
     if "ATR14" in df.columns and not df["ATR14"].dropna().empty:
-        tol = df["ATR14"].median() * sr_merge_atr_mult
+        tol = float(df["ATR14"].median()) * float(sr_merge_atr_mult)
     else:
-        tol = df["Close"].median() * 0.002  # fallback
+        tol = float(df["Close"].median()) * 0.002  # fallback ≈ 0.2%
 
-    def merge_levels(level_series, kind):
+    def to_float_safe(x):
+        """Cast scalar/array/Series-like to float; return NaN if impossible."""
+        try:
+            return float(x)
+        except Exception:
+            try:
+                arr = np.asarray(x, dtype="float64").reshape(-1)
+                return float(arr[0])
+            except Exception:
+                return np.nan
+
+    def merge_levels(level_series: pd.Series, kind: str):
+        """
+        Turn raw swing levels into a clean, ordered list:
+        - drop NaNs, sort by time, coerce to float
+        - merge consecutive levels within 'tol' into one average level
+        """
+        s = pd.Series(level_series).dropna().sort_index()
         levels = []
-        for ts, lvl in level_series.dropna().items():
-            lvl = float(lvl)
+        for ts, val in s.items():
+            lvl = to_float_safe(val)
+            if np.isnan(lvl):
+                continue
             if not levels or abs(lvl - levels[-1]["price"]) > tol:
                 levels.append({"price": lvl, "time": ts, "kind": kind})
             else:
-                # average nearby levels
+                # merge into previous (average the prices; last time wins)
                 levels[-1]["price"] = (levels[-1]["price"] + lvl) / 2.0
-                levels[-1]["time"] = ts
+                levels[-1]["time"]  = ts
         return levels
 
+    # Final S/R list (supports + resistances)
     sr_levels = merge_levels(piv_sup, "S") + merge_levels(piv_res, "R")
 
+    # Basic breakout + pullback detection (optional)
     if detect_breakouts and sr_levels:
         last_S = max([l for l in sr_levels if l["kind"] == "S"], key=lambda x: x["time"], default=None)
         last_R = max([l for l in sr_levels if l["kind"] == "R"], key=lambda x: x["time"], default=None)
 
         c = df["Close"]
+        # Up breakout
         if last_R is not None and (c.shift(1) <= last_R["price"]).iloc[-1] and (c > last_R["price"]).iloc[-1]:
-            breakouts.append({"when": c.index[-1], "type": "Breakout ↑", "level": last_R["price"]})
+            breakouts.append({"when": c.index[-1], "type": "Breakout ↑", "level": float(last_R["price"])})
+        # Down breakout
         if last_S is not None and (c.shift(1) >= last_S["price"]).iloc[-1] and (c < last_S["price"]).iloc[-1]:
-            breakouts.append({"when": c.index[-1], "type": "Breakdown ↓", "level": last_S["price"]})
+            breakouts.append({"when": c.index[-1], "type": "Breakdown ↓", "level": float(last_S["price"])})
 
-        if "ATR14" in df.columns and breakouts:
-            atr = float(df["ATR14"].iloc[-1])
+        # Pullback (“return”): revisit within 0.5×ATR after breakout
+        if "ATR14" in df.columns and not df["ATR14"].dropna().empty and breakouts:
+            atr  = float(df["ATR14"].iloc[-1])
+            last = float(df["Close"].iloc[-1])
+            band = 0.5 * atr
             for b in breakouts:
-                band = 0.5 * atr
-                last = float(c.iloc[-1])
                 lvl = float(b["level"])
                 if b["type"] == "Breakout ↑" and (lvl <= last <= lvl + band):
                     b["return"] = "Pullback to R→S"
                 if b["type"] == "Breakdown ↓" and (lvl - band <= last <= lvl):
                     b["return"] = "Pullback to S→R"
 
-# ---------------- Plot ----------------
-# build row heights dynamically to match how many panels we show
-heights = [0.46, 0.18]  # price + volume are always present
+
+# =============================================================================
+# 6) PLOTTING (Plotly subplots)
+#    - Price (candles + SMAs + BB + S/R + breakout markers)
+#    - Volume
+#    - Optional: RSI, MACD, ATR panels
+# =============================================================================
+
+# Build row heights to match how many panels we show (price+volume always on)
+heights = [0.46, 0.18]
 if show_rsi:  heights.append(0.18)
 if show_macd: heights.append(0.18)
 if show_atr:  heights.append(0.18)
 rows = len(heights)
 
-fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=heights, vertical_spacing=0.03)
+fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
+                    row_heights=heights, vertical_spacing=0.03)
 
-row_idx = 1
-# Price
-fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"), row=row_idx, col=1)
+row = 1
+# --- Price panel (row 1)
+fig.add_trace(
+    go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
+                   low=df["Low"], close=df["Close"], name="Price"),
+    row=row, col=1
+)
+
+# Overlay SMAs
 for col, dash in [("SMA20","solid"), ("SMA50","dot"), ("SMA200","dash")]:
     if col in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col, mode="lines", line=dict(dash=dash)), row=row_idx, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col,
+                                 mode="lines", line=dict(dash=dash)),
+                      row=row, col=1)
+
+# Overlay Bollinger Bands
 if show_bb and {"BB_up","BB_lo"} <= set(df.columns):
-    fig.add_trace(go.Scatter(x=df.index, y=df["BB_up"], name="BB up", mode="lines", opacity=0.6), row=row_idx, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["BB_lo"], name="BB lo", mode="lines", opacity=0.6), row=row_idx, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_up"], name="BB up",
+                             mode="lines", opacity=0.6), row=row, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_lo"], name="BB lo",
+                             mode="lines", opacity=0.6), row=row, col=1)
+
+# Draw S/R horizontal lines
 for lvl in sr_levels:
     fig.add_hline(y=lvl["price"], line_width=1, opacity=0.3,
-                  line_dash="dot" if lvl["kind"]=="S" else "dash",
-                  row=row_idx, col=1)
+                  line_dash="dot" if lvl["kind"] == "S" else "dash",
+                  row=row, col=1)
+
+# Breakout markers (with optional pullback note)
 for b in breakouts:
     label = b["type"] + (f" ({b.get('return')})" if b.get("return") else "")
-    fig.add_trace(go.Scatter(x=[b["when"]], y=[b["level"]], mode="markers+text",
-                             text=[label], textposition="top center", name=b["type"]), row=row_idx, col=1)
+    fig.add_trace(
+        go.Scatter(x=[b["when"]], y=[b["level"]], mode="markers+text",
+                   text=[label], textposition="top center", name=b["type"]),
+        row=row, col=1
+    )
 
-# Volume
-row_idx += 1
-fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", opacity=0.6), row=row_idx, col=1)
+# --- Volume (row 2)
+row += 1
+fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", opacity=0.6),
+              row=row, col=1)
 
-# RSI
+# --- RSI panel
 if show_rsi:
-    row_idx += 1
-    fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14", mode="lines"), row=row_idx, col=1)
-    fig.add_hrect(y0=30, y1=70, fillcolor="lightgray", opacity=0.2, line_width=0, row=row_idx, col=1)
+    row += 1
+    fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14", mode="lines"),
+                  row=row, col=1)
+    # 30-70 neutral band
+    fig.add_hrect(y0=30, y1=70, fillcolor="lightgray", opacity=0.2,
+                  line_width=0, row=row, col=1)
 
-# MACD
+# --- MACD panel
 if show_macd:
-    row_idx += 1
-    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"), row=row_idx, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["MACDsig"], name="Signal", mode="lines"), row=row_idx, col=1)
-    fig.add_trace(go.Bar(x=df.index, y=df["MACDhist"], name="Hist", opacity=0.5), row=row_idx, col=1)
+    row += 1
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"),
+                  row=row, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACDsig"], name="Signal", mode="lines"),
+                  row=row, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df["MACDhist"], name="Hist", opacity=0.5),
+                  row=row, col=1)
 
-# ATR
+# --- ATR panel
 if show_atr:
-    row_idx += 1
-    fig.add_trace(go.Scatter(x=df.index, y=df["ATR14"], name="ATR14", mode="lines"), row=row_idx, col=1)
+    row += 1
+    fig.add_trace(go.Scatter(x=df.index, y=df["ATR14"], name="ATR14", mode="lines"),
+                  row=row, col=1)
 
+# Layout polish
 fig.update_layout(
     title=f"{symbol} — {interval} ({period})",
     xaxis_rangeslider_visible=False,
@@ -218,7 +334,10 @@ fig.update_yaxes(showgrid=True, type=("log" if use_log else "linear"), row=1, co
 
 st.plotly_chart(fig, use_container_width=True)
 
-# ---------------- Footer ----------------
+
+# =============================================================================
+# 7) FOOTER: quick stats, data preview, CSV download
+# =============================================================================
 c1, c2, c3 = st.columns(3)
 c1.metric("Last Close", f"{float(df['Close'].iloc[-1]):,.2f}")
 c2.metric("Bars", f"{len(df):,}")
@@ -227,5 +346,8 @@ c3.metric("Start → End", f"{df.index[0].date()} → {df.index[-1].date()}")
 with st.expander("Show data (last 1000 rows)"):
     st.dataframe(df.tail(1000), use_container_width=True)
 
-st.download_button("Download CSV", df.to_csv().encode("utf-8"),
-                   file_name=f"{symbol}_{interval}_{period}.csv")
+st.download_button(
+    "Download CSV",
+    df.to_csv().encode("utf-8"),
+    file_name=f"{symbol}_{interval}_{period}.csv"
+)
