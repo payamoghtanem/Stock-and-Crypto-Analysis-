@@ -132,40 +132,42 @@ if df.empty:
     st.stop()
 
 # =============================================================================
-# 5) SUPPORT/RESISTANCE + BREAKOUTS  (robust 1-D masks)
+# 5) SUPPORT/RESISTANCE + BREAKOUTS  (robust: 1-D arrays + integer indexing)
 # =============================================================================
 sr_levels, breakouts = [], []
 if sr_window and len(df) > sr_window + 5:
-    # Rolling extremes (use min_periods to avoid early NaNs)
+    # Rolling extremes; min_periods avoids early NaNs being treated as valid pivots
     roll_high = df["High"].rolling(sr_window, min_periods=sr_window).max()
     roll_low  = df["Low"].rolling(sr_window,  min_periods=sr_window).min()
 
-    # --- Build 1-D boolean masks using numpy (prevents multidimensional keys)
-    high_vals = df["High"].to_numpy()
-    low_vals  = df["Low"].to_numpy()
-    rh_vals   = roll_high.to_numpy()
-    rl_vals   = roll_low.to_numpy()
+    # 1) Build 1-D numpy arrays
+    high_vals = np.asarray(df["High"]).ravel()
+    low_vals  = np.asarray(df["Low"]).ravel()
+    rh_vals   = np.asarray(roll_high).ravel()
+    rl_vals   = np.asarray(roll_low).ravel()
 
-    mask_res = high_vals >= rh_vals            # potential resistance (swing highs)
-    mask_sup = low_vals  <= rl_vals            # potential support (swing lows)
+    # 2) Valid masks: ensure same length + no-NaN comparisons
+    valid_res = ~np.isnan(high_vals) & ~np.isnan(rh_vals)
+    valid_sup = ~np.isnan(low_vals)  & ~np.isnan(rl_vals)
 
-    # Turn masks back into timestamp-indexed 1-D Series
-    piv_res = pd.Series(high_vals[mask_res], index=df.index[mask_res], name="High")
-    piv_sup = pd.Series(low_vals[mask_sup],  index=df.index[mask_sup],  name="Low")
+    mask_res = valid_res & (high_vals >= rh_vals)
+    mask_sup = valid_sup & (low_vals  <= rl_vals)
 
-    # Merge tolerance
+    # 3) Convert masks to integer positions (avoids boolean-index length issues)
+    idx_res = np.flatnonzero(mask_res)
+    idx_sup = np.flatnonzero(mask_sup)
+
+    # 4) Build Series with matching timestamps by integer take()
+    piv_res = pd.Series(high_vals[idx_res], index=df.index.take(idx_res), name="High")
+    piv_sup = pd.Series(low_vals[idx_sup],  index=df.index.take(idx_sup),  name="Low")
+
+    # 5) Merge nearby levels using ATR-based tolerance (or small fallback)
     if "ATR14" in df.columns and not df["ATR14"].dropna().empty:
         tol = float(df["ATR14"].median()) * float(sr_merge_atr_mult)
     else:
-        tol = float(df["Close"].median()) * 0.002  # fallback ~0.2%
+        tol = float(df["Close"].median()) * 0.002  # ~0.2%
 
     def merge_levels(series: pd.Series, kind: str):
-        """
-        Take a Series of prices with datetime index and:
-        - drop NaNs, sort by time,
-        - coerce to float safely,
-        - merge consecutive points within 'tol' into one averaged level.
-        """
         s = series.dropna().sort_index()
         levels = []
         for ts, val in s.items():
@@ -176,27 +178,24 @@ if sr_window and len(df) > sr_window + 5:
             if not levels or abs(lvl - levels[-1]["price"]) > tol:
                 levels.append({"price": lvl, "time": ts, "kind": kind})
             else:
+                # merge with previous (average price; latest time)
                 levels[-1]["price"] = (levels[-1]["price"] + lvl) / 2.0
                 levels[-1]["time"]  = ts
         return levels
 
-    # Final S/R list (supports + resistances)
     sr_levels = merge_levels(piv_sup, "S") + merge_levels(piv_res, "R")
 
-    # Breakouts + pullbacks (simple rules)
+    # 6) Breakout + pullback (simple rules)
     if detect_breakouts and sr_levels:
         last_S = max([l for l in sr_levels if l["kind"] == "S"], key=lambda x: x["time"], default=None)
         last_R = max([l for l in sr_levels if l["kind"] == "R"], key=lambda x: x["time"], default=None)
 
         c = df["Close"]
-        # Up breakout: close crosses ABOVE last R
         if last_R is not None and (c.shift(1) <= last_R["price"]).iloc[-1] and (c > last_R["price"]).iloc[-1]:
             breakouts.append({"when": c.index[-1], "type": "Breakout ↑", "level": float(last_R["price"])})
-        # Down breakout: close crosses BELOW last S
         if last_S is not None and (c.shift(1) >= last_S["price"]).iloc[-1] and (c < last_S["price"]).iloc[-1]:
             breakouts.append({"when": c.index[-1], "type": "Breakdown ↓", "level": float(last_S["price"])})
 
-        # Pullback/return = revisit within 0.5×ATR
         if "ATR14" in df.columns and not df["ATR14"].dropna().empty and breakouts:
             atr  = float(df["ATR14"].iloc[-1])
             last = float(df["Close"].iloc[-1])
