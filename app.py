@@ -174,3 +174,94 @@ if sr_window and len(df) > sr_window + 5:
             for b in breakouts:
                 band = atr * 0.5
                 lvl = b["level"]
+                last = c.iloc[-1]
+                if b["type"] == "Breakout ↑" and abs(last - lvl) <= band and last >= lvl:
+                    b["return"] = "Pullback to R→S"
+                if b["type"] == "Breakdown ↓" and abs(last - lvl) <= band and last <= lvl:
+                    b["return"] = "Pullback to S→R"
+
+# -----------------------------
+# Plot
+# -----------------------------
+rows = 2 + int(show_rsi) + int(show_macd) + int(show_atr)
+fig = make_subplots(
+    rows=rows, cols=1, shared_xaxes=True,
+    row_heights=[0.46] + [0.18] + [0.18 if show_rsi else 0] + [0.18 if show_macd else 0] + [0.18 if show_atr else 0],
+    vertical_spacing=0.03
+)
+
+row_idx = 1
+
+# Price panel
+fig.add_trace(
+    go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"),
+    row=row_idx, col=1
+)
+
+for col, dash in [("SMA20","solid"), ("SMA50","dot"), ("SMA200","dash")]:
+    if col in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col, mode="lines", line=dict(dash=dash)), row=row_idx, col=1)
+
+if show_bb and {"BB_up","BB_lo"} <= set(df.columns):
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_up"], name="BB up", mode="lines", opacity=0.6), row=row_idx, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_lo"], name="BB lo", mode="lines", opacity=0.6), row=row_idx, col=1)
+
+# Plot S/R levels as horizontal lines
+for lvl in sr_levels:
+    fig.add_hline(y=lvl["price"], line_width=1, opacity=0.3,
+                  line_dash="dot" if lvl["kind"]=="S" else "dash",
+                  row=row_idx, col=1)
+
+# Breakout markers
+for b in breakouts:
+    fig.add_trace(
+        go.Scatter(x=[b["when"]], y=[b["level"]], mode="markers+text",
+                   text=[b["type"]], textposition="top center", name=b["type"]),
+        row=row_idx, col=1
+    )
+
+# Volume panel
+row_idx += 1
+fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", opacity=0.6), row=row_idx, col=1)
+
+# RSI
+if show_rsi:
+    row_idx += 1
+    fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14", mode="lines"), row=row_idx, col=1)
+    fig.add_hrect(y0=30, y1=70, fillcolor="lightgray", opacity=0.2, line_width=0, row=row_idx, col=1)
+
+# MACD
+if show_macd:
+    row_idx += 1
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"), row=row_idx, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACDsig"], name="Signal", mode="lines"), row=row_idx, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df["MACDhist"], name="Hist", opacity=0.5), row=row_idx, col=1)
+
+# ATR
+if show_atr:
+    row_idx += 1
+    fig.add_trace(go.Scatter(x=df.index, y=df["ATR14"], name="ATR14", mode="lines"), row=row_idx, col=1)
+
+fig.update_layout(
+    title=f"{symbol} — {interval} ({period})",
+    xaxis_rangeslider_visible=False,
+    hovermode="x unified",
+    margin=dict(l=10, r=10, t=40, b=10),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+)
+fig.update_xaxes(showgrid=True)
+fig.update_yaxes(showgrid=True, type=("log" if use_log else "linear"), row=1, col=1)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# Stats + data
+c1, c2, c3 = st.columns(3)
+c1.metric("Last Close", f"{float(df['Close'].iloc[-1]):,.2f}")
+c2.metric("Bars", f"{len(df):,}")
+c3.metric("Start → End", f"{df.index[0].date()} → {df.index[-1].date()}")
+
+with st.expander("Show data (last 1000 rows)"):
+    st.dataframe(df.tail(1000), use_container_width=True)
+
+st.download_button("Download CSV", df.to_csv().encode("utf-8"),
+                   file_name=f"{symbol}_{interval}_{period}.csv")
