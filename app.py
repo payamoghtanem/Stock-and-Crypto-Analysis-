@@ -185,27 +185,38 @@ if sr_window and len(df) > sr_window + 5:
 
     sr_levels = merge_levels(piv_sup, "S") + merge_levels(piv_res, "R")
 
-    # 6) Breakout + pullback (simple rules)
+    # 6) Breakout + pullback (scalar-safe)
     if detect_breakouts and sr_levels:
         last_S = max([l for l in sr_levels if l["kind"] == "S"], key=lambda x: x["time"], default=None)
         last_R = max([l for l in sr_levels if l["kind"] == "R"], key=lambda x: x["time"], default=None)
 
-        c = df["Close"]
-        if last_R is not None and (c.shift(1) <= last_R["price"]).iloc[-1] and (c > last_R["price"]).iloc[-1]:
-            breakouts.append({"when": c.index[-1], "type": "Breakout ↑", "level": float(last_R["price"])})
-        if last_S is not None and (c.shift(1) >= last_S["price"]).iloc[-1] and (c < last_S["price"]).iloc[-1]:
-            breakouts.append({"when": c.index[-1], "type": "Breakdown ↓", "level": float(last_S["price"])})
+        # Need at least 2 closes to test a cross
+        if len(df["Close"]) >= 2:
+            prev_close = float(df["Close"].iloc[-2])
+            last_close = float(df["Close"].iloc[-1])
 
-        if "ATR14" in df.columns and not df["ATR14"].dropna().empty and breakouts:
-            atr  = float(df["ATR14"].iloc[-1])
-            last = float(df["Close"].iloc[-1])
-            band = 0.5 * atr
-            for b in breakouts:
-                lvl = float(b["level"])
-                if b["type"] == "Breakout ↑" and (lvl <= last <= lvl + band):
-                    b["return"] = "Pullback to R→S"
-                if b["type"] == "Breakdown ↓" and (lvl - band <= last <= lvl):
-                    b["return"] = "Pullback to S→R"
+            # Up breakout: cross ABOVE last resistance
+            if last_R is not None:
+                r_price = float(last_R["price"])
+                if (prev_close <= r_price) and (last_close > r_price):
+                    breakouts.append({"when": df.index[-1], "type": "Breakout ↑", "level": r_price})
+
+            # Down breakout: cross BELOW last support
+            if last_S is not None:
+                s_price = float(last_S["price"])
+                if (prev_close >= s_price) and (last_close < s_price):
+                    breakouts.append({"when": df.index[-1], "type": "Breakdown ↓", "level": s_price})
+
+            # Pullback/return = revisit within 0.5×ATR after breakout
+            if "ATR14" in df.columns and not df["ATR14"].dropna().empty and breakouts:
+                atr  = float(df["ATR14"].iloc[-1])
+                band = 0.5 * atr
+                for b in breakouts:
+                    lvl = float(b["level"])
+                    if b["type"] == "Breakout ↑" and (lvl <= last_close <= lvl + band):
+                        b["return"] = "Pullback to R→S"
+                    if b["type"] == "Breakdown ↓" and (lvl - band <= last_close <= lvl):
+                        b["return"] = "Pullback to S→R"
 
 
 # =============================================================================
