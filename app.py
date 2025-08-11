@@ -1,19 +1,6 @@
 # =============================================================================
 # Streamlit + Plotly Technical Charting (Yahoo Finance)
-# Bigger, clearer charts using TABS + optional stacked view.
-#
-# Tabs:
-#  1) Price & Volume (candles/line, SMAs, BB, trendlines, S/R, breakouts)
-#  2) Oscillators (RSI, MACD)
-#  3) Volatility (ATR, Bollinger band width)
-#  4) Trends (EMA, Linear OLS, HP filter)
-#  5) Rolling OLS (slope over a moving window)
-#  6) STL Decomposition (trend/seasonal/residual)
-#
-# Notes:
-# - All computations are dynamic after date filtering.
-# - S/R detection is heuristic (rolling extremes + ATR merge).
-# - Educational tool, not trading advice.
+# Tabs + signal engine + last-value labels + zero baselines + help text
 # =============================================================================
 
 from datetime import date, timedelta
@@ -26,24 +13,18 @@ import yfinance as yf
 from statsmodels.tsa.filters.hp_filter import hpfilter
 from statsmodels.tsa.seasonal import STL
 
-# -----------------------------------------------------------------------------
-# Page setup
-# -----------------------------------------------------------------------------
+# ----------------------------- Page ------------------------------------------
 st.set_page_config(page_title="Crypto/Stocks Trend — Tabs", layout="wide")
 st.title("Crypto/Stocks Trend — Interactive (Plotly + Streamlit)")
 
-# -----------------------------------------------------------------------------
-# Sidebar — Data & Layout
-# -----------------------------------------------------------------------------
+# ----------------------------- Sidebar ---------------------------------------
 st.sidebar.header("Data")
-symbol   = st.sidebar.text_input("Symbol", "BTC-USD",
-                                 help="Any Yahoo symbol, e.g., BTC-USD, ETH-USD, AAPL, ^GSPC")
+symbol   = st.sidebar.text_input("Symbol", "BTC-USD", help="Yahoo symbol: e.g., BTC-USD, ETH-USD, AAPL, ^GSPC")
 interval = st.sidebar.selectbox("Interval", ["4h", "1h", "1d"], index=0)
 period   = st.sidebar.selectbox("Download window", ["30d", "90d", "365d", "730d"], index=3)
 
 st.sidebar.header("Layout")
-layout_mode = st.sidebar.radio("Chart layout", ["Tabbed charts", "Single stacked figure"], index=0,
-                               help="Tabbed = largest, clearest. Stacked = all in one.")
+layout_mode = st.sidebar.radio("Chart layout", ["Tabbed charts", "Single stacked figure"], index=0)
 price_mode  = st.sidebar.selectbox("Price display", ["Candles", "Line (Close)"], index=0)
 use_log     = st.sidebar.checkbox("Log scale (price)", False)
 show_volume = st.sidebar.checkbox("Show volume", True)
@@ -63,26 +44,20 @@ show_macd  = st.sidebar.checkbox("MACD (12,26,9)", True)
 show_atr   = st.sidebar.checkbox("ATR (14)", True)
 
 st.sidebar.header("Support / Resistance")
-sr_window = st.sidebar.slider("Swing window (bars)", 10, 300, 50,
-                              help="Lookback used for rolling highs/lows.")
-sr_merge_atr_mult = st.sidebar.slider("Merge tolerance (×ATR)", 0.1, 2.0, 0.5, 0.1,
-                                      help="Nearby levels are merged if within this ATR multiple.")
+sr_window = st.sidebar.slider("Swing window (bars)", 10, 300, 50)
+sr_merge_atr_mult = st.sidebar.slider("Merge tolerance (×ATR)", 0.1, 2.0, 0.5, 0.1)
 detect_breakouts = st.sidebar.checkbox("Detect breakouts/returns", True)
 
 st.sidebar.header("Advanced trends")
 hp_lambda = st.sidebar.number_input("HP filter λ", 100.0, 200000.0, 1600.0, step=100.0,
-                                    help="Higher λ → smoother trend (commonly 1600 for hourly-ish data).")
-rols_win  = st.sidebar.slider("Rolling OLS window (bars)", 20, 500, 120,
-                              help="Window size for slope computed over moving regression.")
-stl_period = st.sidebar.slider("STL seasonal period (bars)", 10, 200, 42,
-                               help="e.g., 42 bars ≈ 1 week for 4h candles.")
+                                    help="Higher λ → smoother trend (e.g., 1600 for 4h/daily).")
+rols_win  = st.sidebar.slider("Rolling OLS window (bars)", 20, 500, 120)
+stl_period = st.sidebar.slider("STL seasonal period (bars)", 10, 200, 42)
 
 if st.sidebar.button("Refresh now"):
     st.cache_data.clear()
 
-# -----------------------------------------------------------------------------
-# Data loading (cached)
-# -----------------------------------------------------------------------------
+# ----------------------------- Data (cached) ----------------------------------
 @st.cache_data(ttl=60*15, show_spinner=False)
 def load_data(sym: str, per: str, inter: str) -> pd.DataFrame:
     df = yf.download(sym, period=per, interval=inter, auto_adjust=False, progress=False)
@@ -90,16 +65,12 @@ def load_data(sym: str, per: str, inter: str) -> pd.DataFrame:
 
 with st.spinner("Loading data…"):
     df = load_data(symbol, period, interval)
-
 if df.empty:
     st.warning("No data returned. Try a shorter period or a different interval.")
     st.stop()
-
 df = df.copy()
 
-# -----------------------------------------------------------------------------
-# Indicators/trend helpers (computed BEFORE date filter; re-evaluated after)
-# -----------------------------------------------------------------------------
+# ----------------------------- Indicators ------------------------------------
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
 
@@ -108,27 +79,27 @@ if show_ma20:  df["SMA20"]  = df["Close"].rolling(20).mean()
 if show_ma50:  df["SMA50"]  = df["Close"].rolling(50).mean()
 if show_ma200: df["SMA200"] = df["Close"].rolling(200).mean()
 
-# Bollinger Bands (20,2) + Band Width (%)
+# Bollinger bands + width
 if show_bb:
     mid = df["Close"].rolling(20).mean()
     std = df["Close"].rolling(20).std(ddof=0)
     df["BB_mid"] = mid
     df["BB_up"]  = mid + 2*std
     df["BB_lo"]  = mid - 2*std
-    bw = (df["BB_up"] - df["BB_lo"]) / df["BB_mid"]
-    df["BB_width_pct"] = (bw.replace([np.inf, -np.inf], np.nan) * 100)
+    width_pct = (df["BB_up"] - df["BB_lo"]) / df["BB_mid"] * 100
+    df["BB_width_pct"] = width_pct.replace([np.inf, -np.inf], np.nan)
 
-# RSI(14)
+# RSI
 if show_rsi:
-    delta  = df["Close"].diff()
-    gains  = delta.clip(lower=0)
-    losses = (-delta).clip(lower=0)
-    avg_up = gains.ewm(alpha=1/14, adjust=False).mean()
-    avg_dn = losses.ewm(alpha=1/14, adjust=False).mean()
+    d   = df["Close"].diff()
+    up  = d.clip(lower=0)
+    dn  = (-d).clip(lower=0)
+    avg_up = up.ewm(alpha=1/14, adjust=False).mean()
+    avg_dn = dn.ewm(alpha=1/14, adjust=False).mean()
     rs = avg_up / avg_dn.replace(0, np.nan)
     df["RSI14"] = 100 - (100 / (1 + rs))
 
-# MACD(12,26,9)
+# MACD
 if show_macd:
     ema12 = ema(df["Close"], 12)
     ema26 = ema(df["Close"], 26)
@@ -136,26 +107,20 @@ if show_macd:
     df["MACDsig"] = ema(df["MACD"], 9)
     df["MACDhist"]= df["MACD"] - df["MACDsig"]
 
-# ATR(14)
+# ATR (also used in S/R merging)
 if show_atr or detect_breakouts:
     pc = df["Close"].shift(1)
-    tr = pd.concat([
-        (df["High"] - df["Low"]).abs(),
-        (df["High"] - pc).abs(),
-        (df["Low"]  - pc).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([(df["High"]-df["Low"]).abs(),
+                    (df["High"]-pc).abs(),
+                    (df["Low"] -pc).abs()], axis=1).max(axis=1)
     df["ATR14"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
 # EMA trend
 if show_ema_trend:
     df[f"EMA{ema_len}"] = ema(df["Close"], int(ema_len))
 
-# -----------------------------------------------------------------------------
-# Date filter (no re-download)
-# -----------------------------------------------------------------------------
-min_date = df.index.min().date()
-max_date = df.index.max().date()
-
+# ----------------------------- Date filter -----------------------------------
+min_date = df.index.min().date(); max_date = df.index.max().date()
 st.sidebar.header("Date range (filter)")
 start_date, end_date = st.sidebar.date_input(
     "Start / End",
@@ -164,70 +129,53 @@ start_date, end_date = st.sidebar.date_input(
 )
 if isinstance(start_date, date) and isinstance(end_date, date) and start_date <= end_date:
     df = df.loc[str(start_date):str(end_date)]
-
 if df.empty:
     st.warning("No data after filtering.")
     st.stop()
 
-# Linear trendline across the *visible* window
+# Linear trend across visible window
 if show_lin_trend and len(df) >= 2:
     x = np.arange(len(df), dtype=float)
     m, b = np.polyfit(x, df["Close"].astype(float), 1)
     df["LIN_TREND"] = m * x + b
 
-# HP filter (trend & cycle) on visible window
-close_float = df["Close"].astype(float)
-hp_trend, hp_cycle = hpfilter(close_float, lamb=hp_lambda)
+# HP filter & Rolling OLS & STL
+close_f = df["Close"].astype(float)
+hp_trend, hp_cycle = hpfilter(close_f, lamb=hp_lambda)
 df["HP_trend"] = hp_trend
 df["HP_cycle"] = hp_cycle
 
-# Rolling OLS: slope per window (simple lambda → fine for a few thousand bars)
 def rolling_slope(y: pd.Series, win: int) -> pd.Series:
-    if len(y) < win:
-        return pd.Series(index=y.index, dtype=float)
+    if len(y) < win: return pd.Series(index=y.index, dtype=float)
     return y.rolling(win).apply(lambda s: np.polyfit(np.arange(len(s)), s, 1)[0], raw=False)
+df["ROLL_SLOPE"] = rolling_slope(close_f, rols_win)
 
-df["ROLL_SLOPE"] = rolling_slope(close_float, rols_win)
-
-# STL decomposition (trend/seasonal/resid) — needs a period guess
-stl_components = None
 try:
-    stl = STL(close_float, period=int(stl_period), robust=True).fit()
-    stl_components = {
-        "trend": stl.trend,
-        "seasonal": stl.seasonal,
-        "resid": stl.resid,
-    }
+    stl = STL(close_f, period=int(stl_period), robust=True).fit()
+    STL_OK = True
 except Exception:
-    # If STL fails (e.g., too few points), we simply skip plotting it.
-    stl_components = None
+    STL_OK = False
 
-# -----------------------------------------------------------------------------
-# Support/Resistance + Breakouts  (robust, 1-D masks)
-# -----------------------------------------------------------------------------
+# ----------------------------- Support/Resistance + Breakouts ----------------
 sr_levels, breakouts = [], []
 if sr_window and len(df) > sr_window + 5:
-    roll_high = df["High"].rolling(sr_window, min_periods=sr_window).max()
-    roll_low  = df["Low"].rolling(sr_window,  min_periods=sr_window).min()
+    rh = df["High"].rolling(sr_window, min_periods=sr_window).max()
+    rl = df["Low"].rolling(sr_window,  min_periods=sr_window).min()
 
     hv = np.asarray(df["High"]).ravel()
     lv = np.asarray(df["Low"]).ravel()
-    rh = np.asarray(roll_high).ravel()
-    rl = np.asarray(roll_low).ravel()
+    rhv = np.asarray(rh).ravel()
+    rlv = np.asarray(rl).ravel()
 
-    mask_res = (~np.isnan(hv) & ~np.isnan(rh) & (hv >= rh))
-    mask_sup = (~np.isnan(lv) & ~np.isnan(rl) & (lv <= rl))
-
-    idx_res = np.flatnonzero(mask_res)
-    idx_sup = np.flatnonzero(mask_sup)
+    idx_res = np.flatnonzero((~np.isnan(hv)) & (~np.isnan(rhv)) & (hv >= rhv))
+    idx_sup = np.flatnonzero((~np.isnan(lv)) & (~np.isnan(rlv)) & (lv <= rlv))
 
     piv_res = pd.Series(hv[idx_res], index=df.index.take(idx_res), name="High")
     piv_sup = pd.Series(lv[idx_sup],  index=df.index.take(idx_sup),  name="Low")
 
-    if "ATR14" in df.columns and not df["ATR14"].dropna().empty:
-        tol = float(df["ATR14"].median()) * float(sr_merge_atr_mult)
-    else:
-        tol = float(df["Close"].median()) * 0.002
+    tol = (float(df["ATR14"].median()) * float(sr_merge_atr_mult)
+           if "ATR14" in df and not df["ATR14"].dropna().empty
+           else float(df["Close"].median()) * 0.002)
 
     def merge_levels(series: pd.Series, kind: str):
         s = series.dropna().sort_index()
@@ -240,7 +188,7 @@ if sr_window and len(df) > sr_window + 5:
             if not levels or abs(lvl - levels[-1]["price"]) > tol:
                 levels.append({"price": lvl, "time": ts, "kind": kind})
             else:
-                levels[-1]["price"] = (levels[-1]["price"] + lvl) / 2.0
+                levels[-1]["price"] = (levels[-1]["price"] + lvl)/2.0
                 levels[-1]["time"]  = ts
         return levels
 
@@ -249,64 +197,106 @@ if sr_window and len(df) > sr_window + 5:
     if detect_breakouts and len(df) >= 2:
         last_S = max([l for l in sr_levels if l["kind"] == "S"], key=lambda x: x["time"], default=None)
         last_R = max([l for l in sr_levels if l["kind"] == "R"], key=lambda x: x["time"], default=None)
-        prev_close = float(df["Close"].iloc[-2])
-        last_close = float(df["Close"].iloc[-1])
+        prev_c, last_c = float(df["Close"].iloc[-2]), float(df["Close"].iloc[-1])
 
         if last_R is not None:
             r = float(last_R["price"])
-            if (prev_close <= r) and (last_close > r):
+            if (prev_c <= r) and (last_c > r):
                 breakouts.append({"when": df.index[-1], "type": "Breakout ↑", "level": r})
         if last_S is not None:
             s_ = float(last_S["price"])
-            if (prev_close >= s_) and (last_close < s_):
+            if (prev_c >= s_) and (last_c < s_):
                 breakouts.append({"when": df.index[-1], "type": "Breakdown ↓", "level": s_})
 
-        if "ATR14" in df.columns and not df["ATR14"].dropna().empty and breakouts:
-            atr  = float(df["ATR14"].iloc[-1])
-            band = 0.5 * atr
+        if "ATR14" in df and not df["ATR14"].dropna().empty and breakouts:
+            atr  = float(df["ATR14"].iloc[-1]); band = 0.5*atr
             for b in breakouts:
                 lvl = float(b["level"])
-                if b["type"] == "Breakout ↑" and (lvl <= last_close <= lvl + band):
+                if b["type"] == "Breakout ↑" and (lvl <= last_c <= lvl + band):
                     b["return"] = "Pullback to R→S"
-                if b["type"] == "Breakdown ↓" and (lvl - band <= last_close <= lvl):
+                if b["type"] == "Breakdown ↓" and (lvl - band <= last_c <= lvl):
                     b["return"] = "Pullback to S→R"
 
-# -----------------------------------------------------------------------------
-# Plotting helpers (each tab builds its own large figure)
-# -----------------------------------------------------------------------------
-def add_price_traces(fig, row=1, title_suffix=""):
-    """Add price + overlays + S/R + breakouts to a figure."""
+# ----------------------------- Signal Engine ---------------------------------
+def last_cross(spread: pd.Series) -> int:
+    """+1 crossed up recently, -1 crossed down, 0 none."""
+    if len(spread) < 2: return 0
+    a, b = spread.iloc[-2], spread.iloc[-1]
+    if (a <= 0) and (b > 0):  return +1
+    if (a >= 0) and (b < 0):  return -1
+    return 0
+
+def compute_signal(df: pd.DataFrame) -> dict:
+    sig = {}
+    sig["close"]  = float(df["Close"].iloc[-1])
+    sig["sma50"]  = float(df.get("SMA50", df["Close"]).iloc[-1])
+    sig["sma200"] = float(df.get("SMA200", df["Close"]).iloc[-1])
+    sig["rsi"]    = float(df.get("RSI14", pd.Series([np.nan])).iloc[-1])
+    if {"MACD","MACDsig"}.issubset(df.columns):
+        spread = df["MACD"] - df["MACDsig"]
+        sig["macd"] = float(df["MACD"].iloc[-1])
+        sig["macd_cross"] = last_cross(spread)
+    else:
+        sig["macd"] = np.nan; sig["macd_cross"] = 0
+
+    buy = (
+        (sig["close"] > sig["sma50"] > sig["sma200"]) and
+        ("SMA50" not in df or df["SMA50"].diff().iloc[-1] > 0) and
+        (sig["macd"] > 0) and (sig["macd_cross"] == +1) and
+        (np.isnan(sig["rsi"]) or 45 <= sig["rsi"] <= 70)
+    )
+    sell = ((sig["close"] < sig["sma50"] < sig["sma200"]) or
+            (sig["macd"] < 0 and sig["macd_cross"] == -1))
+    label, emoji = ("Hold", "⏸️")
+    if buy:  label, emoji = ("Buy (trend-following)", "🟢")
+    elif sell: label, emoji = ("Sell / Reduce", "🔴")
+    sig["label"], sig["emoji"] = label, emoji
+    return sig
+
+# ----------------------------- Plot helpers ----------------------------------
+def add_last_label(fig, x, y, name, row=1, col=1):
+    """Put a small marker + text on the last value of a series."""
+    if len(x) == 0: return
+    fig.add_trace(go.Scatter(
+        x=[x[-1]], y=[y[-1]], mode="markers+text",
+        marker=dict(size=9), text=[f"{y[-1]:,.2f}"], textposition="bottom right",
+        name=f"{name} last"
+    ), row=row, col=1)
+
+def add_price_traces(fig, row=1):
+    """Price + overlays + S/R + breakouts (and last labels)."""
     if price_mode == "Candles":
         fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
                                      low=df["Low"], close=df["Close"], name="Price"),
                       row=row, col=1)
+        add_last_label(fig, df.index, df["Close"].values, "Price", row=row)
     else:
         fig.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines", name="Price"),
                       row=row, col=1)
+        add_last_label(fig, df.index, df["Close"].values, "Price", row=row)
 
     # Trendlines
-    if show_ema_trend and f"EMA{ema_len}" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df[f"EMA{ema_len}"], name=f"EMA{ema_len}", mode="lines"),
-                      row=row, col=1)
-    if show_lin_trend and "LIN_TREND" in df.columns:
+    if show_ema_trend and f"EMA{ema_len}" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df[f"EMA{ema_len}"], name=f"EMA{ema_len}", mode="lines"), row=row, col=1)
+        add_last_label(fig, df.index, df[f"EMA{ema_len}"].values, f"EMA{ema_len}", row=row)
+    if show_lin_trend and "LIN_TREND" in df:
         fig.add_trace(go.Scatter(x=df.index, y=df["LIN_TREND"], name="Linear trend",
                                  mode="lines", line=dict(dash="dash")), row=row, col=1)
+        add_last_label(fig, df.index, df["LIN_TREND"].values, "Linear", row=row)
 
     # SMAs
-    for col, dash in [("SMA20","solid"), ("SMA50","dot"), ("SMA200","dash")]:
-        if col in df.columns:
-            fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col,
-                                     mode="lines", line=dict(dash=dash)),
-                          row=row, col=1)
+    for colname, dash in [("SMA20","solid"), ("SMA50","dot"), ("SMA200","dash")]:
+        if colname in df:
+            fig.add_trace(go.Scatter(x=df.index, y=df[colname], name=colname,
+                                     mode="lines", line=dict(dash=dash)), row=row, col=1)
+            add_last_label(fig, df.index, df[colname].values, colname, row=row)
 
-    # Bollinger bands
+    # BB
     if show_bb and {"BB_up","BB_lo"} <= set(df.columns):
-        fig.add_trace(go.Scatter(x=df.index, y=df["BB_up"], name="BB up", mode="lines", opacity=0.5),
-                      row=row, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df["BB_lo"], name="BB lo", mode="lines", opacity=0.5),
-                      row=row, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_up"], name="BB up", mode="lines", opacity=0.5), row=row, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_lo"], name="BB lo", mode="lines", opacity=0.5), row=row, col=1)
 
-    # S/R lines + breakouts
+    # S/R + breakouts
     for lvl in sr_levels:
         fig.add_hline(y=lvl["price"], line_width=1, opacity=0.3,
                       line_dash="dot" if lvl["kind"] == "S" else "dash", row=row, col=1)
@@ -317,125 +307,176 @@ def add_price_traces(fig, row=1, title_suffix=""):
                       row=row, col=1)
 
 def style(fig, title, height=650):
-    """Common layout polish for all figures."""
     fig.update_layout(
-        title=title,
-        height=height,
-        xaxis_rangeslider_visible=False,
-        hovermode="x unified",
-        margin=dict(l=10, r=10, t=50, b=10),
+        title=title, height=height, xaxis_rangeslider_visible=False,
+        hovermode="x unified", margin=dict(l=10, r=10, t=50, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     fig.update_xaxes(showgrid=True)
     fig.update_yaxes(showgrid=True, type=("log" if use_log else "linear"))
     return fig
 
-# -----------------------------------------------------------------------------
-# Render — either as TABS (recommended) or as a single stacked figure
-# -----------------------------------------------------------------------------
+# ----------------------------- Render ----------------------------------------
 if layout_mode == "Tabbed charts":
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "Price & Volume",
-        "Oscillators",
-        "Volatility",
-        "Trends (EMA/Linear/HP)",
-        "Rolling OLS",
-        "STL Decomposition",
+        "Price & Volume", "Oscillators", "Volatility",
+        "Trends (EMA/Linear/HP)", "Rolling OLS", "STL Decomposition"
     ])
 
+    # --------------- Tab 1: Price & Volume -----------------------------------
     with tab1:
-        fig = make_subplots(rows=2 if show_volume else 1, cols=1, shared_xaxes=True,
+        st.info("Why this chart matters:\n"
+                "- Price trend and key moving averages (20/50/200).\n"
+                "- Bollinger Bands for range and squeezes.\n"
+                "- Support/Resistance with breakout and pullback tags.\n"
+                "- Volume confirms the strength of moves.")
+        sig = compute_signal(df)
+        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**  "
+                    f"| Close `{sig['close']:.2f}` | SMA50 `{sig['sma50']:.2f}` | "
+                    f"SMA200 `{sig['sma200']:.2f}` | MACD `{sig['macd']:.3f}` | RSI `{sig['rsi']:.1f}`")
+
+        rows = 2 if show_volume else 1
+        fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
                             row_heights=[0.75, 0.25] if show_volume else [1.0])
         add_price_traces(fig, row=1)
         if show_volume:
-            fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", opacity=0.6),
-                          row=2, col=1)
+            fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", opacity=0.6), row=2, col=1)
             fig.update_yaxes(title_text="Volume", row=2, col=1)
-        style(fig, f"{symbol} — {interval} ({period})", height=700 if show_volume else 600)
+        style(fig, f"{symbol} — {interval} ({period})", height=700 if show_volume else 620)
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Tip: switch Candles/Line from the sidebar; toggle overlays to declutter.")
 
+    # --------------- Tab 2: Oscillators --------------------------------------
     with tab2:
+        st.info("Why this chart matters:\n"
+                "- RSI: overbought/oversold timing; 30–70 neutral band.\n"
+                "- MACD: momentum bias (above/below 0) and turns (crosses).")
+        sig = compute_signal(df)
+        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}** | MACD `{sig['macd']:.3f}` | RSI `{sig['rsi']:.1f}`")
+
         rows = int(show_rsi) + int(show_macd)
         if rows == 0:
-            st.info("Turn on RSI or MACD from the sidebar to see this tab.")
+            st.info("Turn on RSI or MACD in the sidebar.")
         else:
             fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=[0.5]*rows)
+
             r = 1
             if show_rsi:
                 fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14", mode="lines"), row=r, col=1)
-                fig.add_hrect(y0=30, y1=70, fillcolor="lightgray", opacity=0.2,
-                              line_width=0, row=r, col=1)
+                add_last_label(fig, df.index, df["RSI14"].values, "RSI14", row=r)
+                fig.add_hrect(y0=30, y1=70, fillcolor="lightgray", opacity=0.2, line_width=0, row=r, col=1)
+                fig.update_yaxes(range=[0, 100], row=r, col=1)  # fixed RSI scale
                 r += 1
+
             if show_macd:
                 fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"), row=r, col=1)
                 fig.add_trace(go.Scatter(x=df.index, y=df["MACDsig"], name="Signal", mode="lines"), row=r, col=1)
                 fig.add_trace(go.Bar(x=df.index, y=df["MACDhist"], name="Hist", opacity=0.5), row=r, col=1)
-            style(fig, "Oscillators (RSI, MACD)", height=650)
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("RSI 30–70 band shaded. MACD shows line, signal, and histogram.")
+                fig.add_hline(y=0, line_width=1, opacity=0.3, row=r, col=1)  # zero baseline
+                add_last_label(fig, df.index, df["MACD"].values, "MACD", row=r)
 
+            style(fig, "Oscillators (RSI, MACD)", height=680)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # --------------- Tab 3: Volatility ---------------------------------------
     with tab3:
+        st.info("Why this chart matters:\n"
+                "- ATR = absolute volatility (how wide the daily swing is).\n"
+                "- BB width (%) = relative volatility; very low width = squeeze → watch for break.")
+        sig = compute_signal(df)
+        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**  | ATR `{df['ATR14'].iloc[-1]:.2f}`" 
+                    if "ATR14" in df else "**Signal:** ⏸️ Hold  | ATR N/A")
+
         rows = 1 + int(show_bb and "BB_width_pct" in df)
         fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
                             row_heights=[0.65] + ([0.35] if rows == 2 else []))
-        if show_atr:
+
+        if show_atr and "ATR14" in df:
             fig.add_trace(go.Scatter(x=df.index, y=df["ATR14"], name="ATR14", mode="lines"), row=1, col=1)
+            add_last_label(fig, df.index, df["ATR14"].values, "ATR14", row=1)
         if rows == 2:
             fig.add_trace(go.Scatter(x=df.index, y=df["BB_width_pct"], name="BB width (%)", mode="lines"),
                           row=2, col=1)
-        style(fig, "Volatility (ATR + Bollinger width)", height=650)
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("ATR tracks absolute volatility. Bollinger band width (%) tracks relative volatility.")
+            add_last_label(fig, df.index, df["BB_width_pct"].values, "BB width", row=2)
 
+        style(fig, "Volatility (ATR + Bollinger width)", height=680)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --------------- Tab 4: Trends (EMA/Linear/HP) ----------------------------
     with tab4:
-        fig = make_subplots(rows=1, cols=1)
-        add_price_traces(fig, row=1)
-        if "HP_trend" in df:
-            fig.add_trace(go.Scatter(x=df.index, y=df["HP_trend"], name=f"HP trend (λ={int(hp_lambda)})",
-                                     mode="lines", line=dict(dash="dot")), row=1, col=1)
-        style(fig, "Trendlines (EMA / Linear OLS / HP filter)", height=650)
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("EMA smooths price; Linear OLS fits a straight line; HP filter separates trend & cycle.")
+        st.info("Why this chart matters:\n"
+                "- EMA: fast, smooth trendline.\n"
+                "- Linear OLS: straight-line drift over the visible window.\n"
+                "- HP filter: separates trend from cycles; λ higher = smoother.")
+        sig = compute_signal(df)
+        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**  | Close `{sig['close']:.2f}`  "
+                    f"| Slope(OLS) approx `{(df['LIN_TREND'].diff().iloc[-1] if 'LIN_TREND' in df else 0):.2f}`")
 
-    with tab5:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35])
-        # upper: price (for reference)
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25])
         add_price_traces(fig, row=1)
-        # lower: rolling OLS slope through time
+
+        # HP trend + cycle
+        fig.add_trace(go.Scatter(x=df.index, y=df["HP_trend"], name=f"HP trend (λ={int(hp_lambda)})",
+                                 mode="lines", line=dict(dash="dot")), row=1, col=1)
+        add_last_label(fig, df.index, df["HP_trend"].values, "HP trend", row=1)
+
+        fig.add_trace(go.Scatter(x=df.index, y=df["HP_cycle"], name="HP cycle", mode="lines"), row=2, col=1)
+        fig.add_hline(y=0, line_width=1, opacity=0.3, row=2, col=1)
+        add_last_label(fig, df.index, df["HP_cycle"].values, "HP cycle", row=2)
+
+        style(fig, "Trendlines (EMA / Linear OLS / HP filter)", height=720)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --------------- Tab 5: Rolling OLS slope --------------------------------
+    with tab5:
+        st.info("Why this chart matters:\n"
+                "- Shows the recent slope of price over a moving window.\n"
+                "- Above 0 = upward drift; below 0 = downward drift.")
+        sig = compute_signal(df)
+        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**  | Rolling slope `{df['ROLL_SLOPE'].iloc[-1]:.4f}`")
+
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35])
+        add_price_traces(fig, row=1)
         fig.add_trace(go.Scatter(x=df.index, y=df["ROLL_SLOPE"], name=f"Slope (win={rols_win})", mode="lines"),
                       row=2, col=1)
-        style(fig, "Rolling OLS slope (per bar)", height=700)
+        fig.add_hline(y=0, line_width=1, opacity=0.3, row=2, col=1)
+        add_last_label(fig, df.index, df["ROLL_SLOPE"].values, "Slope", row=2)
+        style(fig, "Rolling OLS slope (per bar)", height=720)
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Positive slope = uptrend over the last window; negative = downtrend.")
 
+    # --------------- Tab 6: STL ----------------------------------------------
     with tab6:
-        if stl_components is None:
-            st.info("STL needs enough data and a valid period. Try expanding the date range or adjust 'STL seasonal period'.")
+        st.info("Why this chart matters:\n"
+                "- Decomposes price into Trend + Seasonal + Residual.\n"
+                "- Helps separate slow drift from repeating patterns and noise.")
+        sig = compute_signal(df)
+        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**")
+
+        if not STL_OK:
+            st.info("STL needs enough data and a valid 'STL seasonal period'. Try expanding the date range or adjust the period.")
         else:
+            stl_fit = STL(close_f, period=int(stl_period), robust=True).fit()
             fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.4, 0.2, 0.2, 0.2])
-            # original close
+            # Close
             fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", mode="lines"), row=1, col=1)
-            # STL components
-            fig.add_trace(go.Scatter(x=df.index, y=stl_components["trend"], name="Trend", mode="lines"), row=2, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=stl_components["seasonal"], name="Seasonal", mode="lines"), row=3, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=stl_components["resid"], name="Residual", mode="lines"), row=4, col=1)
-            style(fig, f"STL Decomposition (period={stl_period})", height=800)
+            add_last_label(fig, df.index, df["Close"].values, "Close", row=1)
+            # Components
+            fig.add_trace(go.Scatter(x=df.index, y=stl_fit.trend, name="Trend", mode="lines"), row=2, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=stl_fit.seasonal, name="Seasonal", mode="lines"), row=3, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=stl_fit.resid, name="Residual", mode="lines"), row=4, col=1)
+            fig.add_hline(y=0, line_width=1, opacity=0.3, row=4, col=1)
+            style(fig, f"STL Decomposition (period={stl_period})", height=820)
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("STL splits the series into Trend + Seasonal + Residual. Period = seasonal cycle length in bars.")
 
 else:
-    # --- Single stacked figure (for users who like everything aligned in one view)
-    # Heights tuned to be readable (you can edit if you prefer different proportions)
+    # ----------------------- Single stacked figure ----------------------------
     heights = [0.45]
     if show_volume: heights.append(0.15)
     if show_rsi:    heights.append(0.15)
     if show_macd:   heights.append(0.15)
     if show_atr:    heights.append(0.10)
-
     rows = len(heights)
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=heights, vertical_spacing=0.03)
 
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=heights, vertical_spacing=0.03)
     r = 1
     add_price_traces(fig, row=r)
     if show_volume:
@@ -446,21 +487,24 @@ else:
         r += 1
         fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14", mode="lines"), row=r, col=1)
         fig.add_hrect(y0=30, y1=70, fillcolor="lightgray", opacity=0.2, line_width=0, row=r, col=1)
+        fig.update_yaxes(range=[0, 100], row=r, col=1)
+        add_last_label(fig, df.index, df["RSI14"].values, "RSI14", row=r)
     if show_macd:
         r += 1
         fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"), row=r, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df["MACDsig"], name="Signal", mode="lines"), row=r, col=1)
         fig.add_trace(go.Bar(x=df.index, y=df["MACDhist"], name="Hist", opacity=0.5), row=r, col=1)
+        fig.add_hline(y=0, line_width=1, opacity=0.3, row=r, col=1)
+        add_last_label(fig, df.index, df["MACD"].values, "MACD", row=r)
     if show_atr:
         r += 1
         fig.add_trace(go.Scatter(x=df.index, y=df["ATR14"], name="ATR14", mode="lines"), row=r, col=1)
+        add_last_label(fig, df.index, df["ATR14"].values, "ATR14", row=r)
 
-    style(fig, f"{symbol} — {interval} ({period})", height=900)
+    style(fig, f"{symbol} — {interval} ({period})", height=920)
     st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# Footer — quick stats, table, CSV
-# -----------------------------------------------------------------------------
+# ----------------------------- Footer ----------------------------------------
 c1, c2, c3 = st.columns(3)
 c1.metric("Last Close", f"{float(df['Close'].iloc[-1]):,.2f}")
 c2.metric("Bars", f"{len(df):,}")
@@ -469,6 +513,5 @@ c3.metric("Start → End", f"{df.index[0].date()} → {df.index[-1].date()}")
 with st.expander("Show data (last 1000 rows)"):
     st.dataframe(df.tail(1000), use_container_width=True)
 
-st.download_button("Download CSV",
-                   df.to_csv().encode("utf-8"),
+st.download_button("Download CSV", df.to_csv().encode("utf-8"),
                    file_name=f"{symbol}_{interval}_{period}.csv")
