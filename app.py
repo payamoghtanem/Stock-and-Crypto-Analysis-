@@ -151,10 +151,10 @@ def rolling_slope(y: pd.Series, win: int) -> pd.Series:
 df["ROLL_SLOPE"] = rolling_slope(close_f, rols_win)
 
 try:
-    stl = STL(close_f, period=int(stl_period), robust=True).fit()
-    STL_OK = True
+    _stl_check = STL(close_f, period=int(stl_period), robust=True).fit()
+    STL_AVAILABLE = True
 except Exception:
-    STL_OK = False
+    STL_AVAILABLE = False
 
 # ----------------------------- Support/Resistance + Breakouts ----------------
 sr_levels, breakouts = [], []
@@ -219,7 +219,6 @@ if sr_window and len(df) > sr_window + 5:
 
 # ----------------------------- Signal Engine ---------------------------------
 def last_cross(spread: pd.Series) -> int:
-    """+1 crossed up recently, -1 crossed down, 0 none."""
     if len(spread) < 2: return 0
     a, b = spread.iloc[-2], spread.iloc[-1]
     if (a <= 0) and (b > 0):  return +1
@@ -255,11 +254,25 @@ def compute_signal(df: pd.DataFrame) -> dict:
 
 # ----------------------------- Plot helpers ----------------------------------
 def add_last_label(fig, x, y, name, row=1, col=1):
-    """Put a small marker + text on the last value of a series."""
-    if len(x) == 0: return
+    """
+    Robust last-value marker + text.
+    - Accepts list/ndarray/Series; coerces to 1-D float.
+    - Skips silently if last value is not finite (NaN/inf) or arrays are empty.
+    """
+    try:
+        y_arr = np.asarray(y, dtype=float).ravel()
+        if y_arr.size == 0 or not np.isfinite(y_arr[-1]):  # nothing to label
+            return
+        x_last = x[-1]
+        y_last = float(y_arr[-1])
+    except Exception:
+        return
     fig.add_trace(go.Scatter(
-        x=[x[-1]], y=[y[-1]], mode="markers+text",
-        marker=dict(size=9), text=[f"{y[-1]:,.2f}"], textposition="bottom right",
+        x=[x_last], y=[y_last],
+        mode="markers+text",
+        marker=dict(size=9),
+        text=[f"{y_last:,.2f}"],
+        textposition="bottom right",
         name=f"{name} last"
     ), row=row, col=1)
 
@@ -383,8 +396,8 @@ if layout_mode == "Tabbed charts":
                 "- ATR = absolute volatility (how wide the daily swing is).\n"
                 "- BB width (%) = relative volatility; very low width = squeeze → watch for break.")
         sig = compute_signal(df)
-        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**  | ATR `{df['ATR14'].iloc[-1]:.2f}`" 
-                    if "ATR14" in df else "**Signal:** ⏸️ Hold  | ATR N/A")
+        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**  | "
+                    f"{'ATR `' + str(df['ATR14'].iloc[-1]) + '`' if 'ATR14' in df else 'ATR N/A'}")
 
         rows = 1 + int(show_bb and "BB_width_pct" in df)
         fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
@@ -408,8 +421,8 @@ if layout_mode == "Tabbed charts":
                 "- Linear OLS: straight-line drift over the visible window.\n"
                 "- HP filter: separates trend from cycles; λ higher = smoother.")
         sig = compute_signal(df)
-        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**  | Close `{sig['close']:.2f}`  "
-                    f"| Slope(OLS) approx `{(df['LIN_TREND'].diff().iloc[-1] if 'LIN_TREND' in df else 0):.2f}`")
+        slope_hint = df["LIN_TREND"].diff().iloc[-1] if "LIN_TREND" in df else 0.0
+        st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**  | Close `{sig['close']:.2f}`  | OLS slope `{slope_hint:.2f}`")
 
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25])
         add_price_traces(fig, row=1)
@@ -451,7 +464,7 @@ if layout_mode == "Tabbed charts":
         sig = compute_signal(df)
         st.markdown(f"**Signal:** {sig['emoji']} **{sig['label']}**")
 
-        if not STL_OK:
+        if not STL_AVAILABLE:
             st.info("STL needs enough data and a valid 'STL seasonal period'. Try expanding the date range or adjust the period.")
         else:
             stl_fit = STL(close_f, period=int(stl_period), robust=True).fit()
